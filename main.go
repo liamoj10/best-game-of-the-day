@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"sort"
@@ -12,8 +13,9 @@ import (
 // -------------------- Data Models --------------------
 
 type Team struct {
-	ID   int    `json:"id"`
-	Name string `json:"full_name"`
+	ID        int    `json:"id"`        // Alphabetical proxy
+	Name      string `json:"full_name"` 
+	RankProxy int    // Use as proxy for ranking heuristic
 }
 
 type Game struct {
@@ -23,8 +25,8 @@ type Game struct {
 	VisitorTeam  Team   `json:"visitor_team"`
 	HomeScore    int    `json:"home_team_score"`
 	VisitorScore int    `json:"visitor_team_score"`
+	League       string // "NBA" or "NFL"
 	Excitement   float64
-	Factors      GameFactors
 }
 
 type APIResponse struct {
@@ -32,68 +34,21 @@ type APIResponse struct {
 	Meta interface{} `json:"meta"`
 }
 
-// -------------------- Game Scoring --------------------
+// -------------------- Helper Functions --------------------
 
-type GameFactors struct {
-	PredictedHomeProb float64
-	Stakes            float64
-	Rivalry           float64
-	StarPower         float64
-	LineMove          float64
-	FormDiff          float64
-	TimeBoost         float64
+func closenessScore(homeRank, visitorRank, maxDiff int) float64 {
+	diff := math.Abs(float64(homeRank - visitorRank))
+	return 1 - diff/float64(maxDiff)
 }
 
-func closeness(prob float64) float64 {
-	if prob > 1 {
-		prob = 1
-	} else if prob < 0 {
-		prob = 0
-	}
-	return 1 - abs(0.5-prob)*2
-}
+// -------------------- Fetch Functions --------------------
 
-func computeScore(f GameFactors) float64 {
-	weights := map[string]float64{
-		"closeness": 0.30,
-		"stakes":    0.20,
-		"rivalry":   0.15,
-		"stars":     0.15,
-		"linemove":  0.10,
-		"form":      0.05,
-		"time":      0.05,
-	}
-	c := closeness(f.PredictedHomeProb)
-	score := c*weights["closeness"] +
-		f.Stakes*weights["stakes"] +
-		f.Rivalry*weights["rivalry"] +
-		f.StarPower*weights["stars"] +
-		f.LineMove*weights["linemove"] +
-		f.FormDiff*weights["form"] +
-		f.TimeBoost*weights["time"]
-	return score
-}
-
-func abs(f float64) float64 {
-	if f < 0 {
-		return -f
-	}
-	return f
-}
-
-func randFloat() float64 {
-	return float64(time.Now().UnixNano()%100) / 100.0
-}
-
-// -------------------- Fetch Games --------------------
-
-func fetchGames(date string) ([]Game, error) {
+func fetchGames(url string, league string) ([]Game, error) {
 	apiKey := os.Getenv("BALLEDONTLIE_API_KEY")
 	if apiKey == "" {
 		return nil, fmt.Errorf("BALLEDONTLIE_API_KEY not set")
 	}
 
-	url := fmt.Sprintf("https://api.balldontlie.io/v1/games?dates[]=%s", date)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, err
@@ -112,65 +67,102 @@ func fetchGames(date string) ([]Game, error) {
 		return nil, err
 	}
 
+	for i := range apiResp.Data {
+		game := &apiResp.Data[i]
+		game.League = league
+
+		// Use ID as ranking proxy
+		game.HomeTeam.RankProxy = game.HomeTeam.ID
+		game.VisitorTeam.RankProxy = game.VisitorTeam.ID
+	}
+
 	return apiResp.Data, nil
+}
+
+func fetchNBAGames(startDate, endDate string) ([]Game, error) {
+	url := fmt.Sprintf("https://api.balldontlie.io/v1/games?start_date=%s&end_date=%s", startDate, endDate)
+	return fetchGames(url, "NBA")
+}
+
+func fetchNFLGames(startDate, endDate string) ([]Game, error) {
+	url := fmt.Sprintf("https://api.balldontlie.io/nfl/v1/games?dates[]=%s&dates[]=%s", startDate, endDate)
+	return fetchGames(url, "NFL")
 }
 
 // -------------------- Main --------------------
 
 func main() {
-	date := time.Now().Format("2006-01-02") // today
-	fmt.Println("Fetching NBA games for", date)
+	today := time.Now()
+	start := today.AddDate(0, 0, 1) // start from tomorrow
+	end := today.AddDate(0, 0, 7)   // 7 days ahead
 
-	games, err := fetchGames(date)
+	startDate := start.Format("2006-01-02")
+	endDate := end.Format("2006-01-02")
+
+	fmt.Printf("Fetching NBA and NFL games from %s to %s (excluding today)\n", startDate, endDate)
+
+	nbaGames, err := fetchNBAGames(startDate, endDate)
 	if err != nil {
-		fmt.Println("Error fetching games:", err)
+		fmt.Println("Error fetching NBA games:", err)
+		nbaGames = []Game{}
+	}
+
+	nflGames, err := fetchNFLGames(startDate, endDate)
+	if err != nil {
+		fmt.Println("Error fetching NFL games:", err)
+		nflGames = []Game{}
+	}
+
+	allGames := append(nbaGames, nflGames...)
+
+	if len(allGames) == 0 {
+		fmt.Println("No games found for the upcoming week.")
 		return
 	}
 
-	if len(games) == 0 {
-		fmt.Println("No games found for this date.")
-		return
+	// Compute rank-proxy closeness
+	maxRank := map[string]int{
+		"NBA": 16, // heuristic max difference
+		"NFL": 32,
 	}
 
-	// Assign mock factors & compute excitement
-	for i := range games {
-		factors := GameFactors{
-			PredictedHomeProb: 0.5 + 0.1*randFloat(),
-			Stakes:            randFloat(),
-			Rivalry:           randFloat(),
-			StarPower:         randFloat(),
-			LineMove:          randFloat(),
-			FormDiff:          randFloat(),
-			TimeBoost:         randFloat(),
+	for i := range allGames {
+		g := &allGames[i]
+
+		homeRank := g.HomeTeam.RankProxy
+		visitorRank := g.VisitorTeam.RankProxy
+
+		// Fallback if missing
+		if homeRank == 0 {
+			homeRank = 1
 		}
-		games[i].Factors = factors
-		games[i].Excitement = computeScore(factors)
+		if visitorRank == 0 {
+			visitorRank = maxRank[g.League]
+		}
+
+		g.Excitement = closenessScore(homeRank, visitorRank, maxRank[g.League])
 	}
 
-	// Sort by excitement descending
-	sort.Slice(games, func(i, j int) bool {
-		return games[i].Excitement > games[j].Excitement
+	// Sort descending by excitement
+	sort.Slice(allGames, func(i, j int) bool {
+		return allGames[i].Excitement > allGames[j].Excitement
 	})
 
-	// Print top games with verbose output
-	topN := 5
-	if len(games) < topN {
-		topN = len(games)
+	// Print top games
+	topN := 10
+	if len(allGames) < topN {
+		topN = len(allGames)
 	}
 
-	fmt.Printf("\nTop %d games for %s:\n\n", topN, date)
+	fmt.Printf("\nTop %d games for upcoming week based on rank-proxy closeness heuristic:\n\n", topN)
 	for i := 0; i < topN; i++ {
-		g := games[i]
-		fmt.Printf("%d. %s vs %s\n", i+1, g.VisitorTeam.Name, g.HomeTeam.Name)
-		fmt.Printf("   Scores: Away %d - Home %d\n", g.VisitorScore, g.HomeScore)
-		fmt.Printf("   Excitement Score: %.3f\n", g.Excitement)
-		fmt.Println("   Factor Breakdown:")
-		fmt.Printf("     Closeness: %.2f\n", closeness(g.Factors.PredictedHomeProb))
-		fmt.Printf("     Stakes: %.2f\n", g.Factors.Stakes)
-		fmt.Printf("     Rivalry: %.2f\n", g.Factors.Rivalry)
-		fmt.Printf("     Star Power: %.2f\n", g.Factors.StarPower)
-		fmt.Printf("     Line Move: %.2f\n", g.Factors.LineMove)
-		fmt.Printf("     Form Diff: %.2f\n", g.Factors.FormDiff)
-		fmt.Printf("     Time Boost: %.2f\n\n", g.Factors.TimeBoost)
+		g := allGames[i]
+		fmt.Printf("%d. [%s] %s (Rank Proxy %d) vs %s (Rank Proxy %d)\n", i+1,
+			g.League,
+			g.VisitorTeam.Name, g.VisitorTeam.RankProxy,
+			g.HomeTeam.Name, g.HomeTeam.RankProxy,
+		)
+		fmt.Printf("   Scores: Away %d - Home %d | Excitement: %.2f\n\n",
+			g.VisitorScore, g.HomeScore, g.Excitement)
 	}
 }
